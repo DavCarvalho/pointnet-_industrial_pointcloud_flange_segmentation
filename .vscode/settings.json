@@ -1,0 +1,5 @@
+{
+    "python.analysis.extraPaths": [
+        "./Pointnet2_PyTorch/pointnet2_ops_lib"
+    ]
+}
