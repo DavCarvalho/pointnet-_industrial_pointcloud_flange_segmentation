@@ -121,7 +121,6 @@ DATA/
 * `main_data_processing()` — Batch process all equipment
 
 **Figure:**
-![Dataset pipeline](images/pipeline_overview.png)
 *Blue = equipment; Orange/Red = flanges (HDBSCAN clusters)*
 
 ## Binary Classification (PointNet2Classifier)
@@ -182,8 +181,6 @@ python models/flange_classification/pointnet_classification_model_flanges.py
 
 **Visualization:** Open3D displays predictions (Red=Flange, Blue=Non-Flange)
 
-![Classification examples](images/classification_examples.png)
-
 ## Semantic Segmentation (PointNet2SemSeg)
 
 **Task:** Point-wise semantic labels for full scenes (Equipment vs Flange).
@@ -199,6 +196,7 @@ We assemble **11-channel** input features:
 * **Curvature** (1) — Local geometric curvature (k-NN variance)
 
 ### Architecture
+<img width="1100" height="476" alt="image" src="https://github.com/user-attachments/assets/25d2959b-41aa-4f95-ad3c-c7baf653fb51" />
 
 ```
 Input: xyz [B, N, 3] + features [B, 8, N]
@@ -288,7 +286,7 @@ python models/equipament_Segmentation_flange/pointnet2_equipment_flange_segmenta
 
 **Stratified Sampling:** Ensures ≥40% flange points per batch when available.
 
-![Segmentation examples](images/output_segmentation/example.png)
+
 
 ## Visualization
 
@@ -306,64 +304,26 @@ tile_prediction(tile_name, model, PCC, Visualization=True)
 * Red: Flange points
 * Blue: Equipment points
 
-### Utility Script
-```bash
-python utils/visualization.py
-```
 
-Processes all `.ply` files in `DATA/inference/` and displays predictions in Open3D.
+## Output Segmentation Model
+### Predction
+<img width="816" height="694" alt="Screenshot 2024-12-11 092301" src="https://github.com/user-attachments/assets/5dcb3e9e-2cec-43c6-a605-3233d973fa08" />
+<img width="666" height="719" alt="Screenshot 2024-12-11 092253" src="https://github.com/user-attachments/assets/0198eb77-f451-4339-ada9-1e82bf652d1f" />
+<img width="702" height="780" alt="Screenshot 2024-12-11 092242" src="https://github.com/user-attachments/assets/35637ca3-cc0c-4b73-87f5-e0a14def4da4" />
+<img width="760" height="847" alt="Screenshot 2024-12-11 092224" src="https://github.com/user-attachments/assets/04aa0a09-cb2f-4a99-8367-42b9b269153c" />
+<img width="1187" height="885" alt="Screenshot 2024-12-11 092213" src="https://github.com/user-attachments/assets/5087b893-640d-489e-97f2-2528d441ad9d" />
 
-## Results
+<img width="854" height="733" alt="Screenshot 2024-12-11 094802" src="https://github.com/user-attachments/assets/4c9c5a80-45b2-4ef5-9a5b-e65027017423" />
+<img width="780" height="913" alt="Screenshot 2024-12-11 094755" src="https://github.com/user-attachments/assets/50e6e077-5afb-48cd-bf34-27eb9e937abc" />
+<img width="1027" height="785" alt="Screenshot 2024-12-11 094823" src="https://github.com/user-attachments/assets/05a6f0c8-79e1-4351-871f-1a0e3a0ba73e" />
 
-### Segmentation Performance
 
-| Metric | Equipment | Flange | Overall |
-|--------|-----------|--------|---------|
-| IoU    | XX.XX%    | XX.XX% | XX.XX%  |
-| Precision | XX.XX% | XX.XX% | XX.XX%  |
-| Recall | XX.XX%    | XX.XX% | XX.XX%  |
-| F1-Score | XX.XX%  | XX.XX% | XX.XX%  |
 
-**Confusion Matrix:**
+### True label
+<img width="1308" height="843" alt="Screenshot 2024-10-30 113428" src="https://github.com/user-attachments/assets/f1878c89-19cb-4196-88e9-c5878d46894c" />
+<img width="1118" height="809" alt="Screenshot 2024-10-30 113418" src="https://github.com/user-attachments/assets/0f463a3f-897b-4ca0-a6c7-b0dc18ef5dab" />
+<img width="1234" height="775" alt="Screenshot 2024-10-30 113341" src="https://github.com/user-attachments/assets/abac58b6-34cc-461e-a64c-dd9917cf2869" />
 
-![Confusion Matrix](images/confusion_matrix.png)
-
-### Visual Results
-
-**Dataset Examples:**
-![Flange clusters](images/view_flanges/example.png)
-
-**Segmentation Output:**
-![CloudCompare view](images/cloudcompare/example.png)
-
-## Where to Put Images
-
-Create image directories and add your figures:
-
-```
-images/
-  ├─ pipeline_overview.png        # Overall dataset builder diagram
-  ├─ architecture_diagram.png     # PointNet++ architecture
-  ├─ classification_examples.png  # Patch classification results
-  ├─ confusion_matrix.png         # Confusion matrix (✓ exists)
-  ├─ cloudcompare/                # Scene visualizations
-  ├─ output_segmentation/         # Segmentation results
-  └─ view_flanges/                # Individual flange examples
-```
-
-### Recommended Image Specifications
-* Format: PNG
-* Max width: 1600px
-* DPI: 150-300 for diagrams
-
-### Markdown Embed Examples
-```markdown
-![Pipeline](images/pipeline_overview.png)
-*Dataset builder: HDBSCAN clustering of flange instances*
-
-![Architecture](images/architecture_diagram.png)
-*PointNet++ with Multi-Scale Grouping and Attention*
-```
 
 ## Reproducibility Notes
 
@@ -441,32 +401,6 @@ python setup.py install
 ### Code
 * Original PointNet2 PyTorch: [erikwijmans/Pointnet2_PyTorch](https://github.com/erikwijmans/Pointnet2_PyTorch)
 
-## Citation
-
-If you use this code in your research, please cite:
-
-```bibtex
-@software{pointnet2_flange_segmentation,
-  author = {Carvalho, David},
-  title = {PointNet++ Industrial Point Cloud Flange Segmentation},
-  year = {2025},
-  url = {https://github.com/DavCarvalho/pointnet-_industrial_pointcloud_flange_segmentation}
-}
-```
-
-## License
-
-This project is licensed under the MIT License.
-
-## Contact
-
-For questions or collaborations:
-* Open an issue on GitHub
-* Contact: [@DavCarvalho](https://github.com/DavCarvalho)
-
----
-
-**Status:** 🚧 Active Development | **Last Updated:** November 2025
 
 **Key Features:**
 ✓ HDBSCAN-based flange instance discovery
