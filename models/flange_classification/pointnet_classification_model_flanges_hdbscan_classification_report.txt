@@ -1,0 +1,8 @@
+              precision    recall  f1-score   support
+
+  Non-Flange       0.89      0.61      0.72       120
+      Flange       0.92      0.98      0.95       584
+
+    accuracy                           0.92       704
+   macro avg       0.91      0.80      0.84       704
+weighted avg       0.92      0.92      0.91       704
