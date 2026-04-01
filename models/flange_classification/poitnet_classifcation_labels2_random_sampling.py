@@ -10,7 +10,7 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 
-from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import GroupShuffleSplit
 from sklearn.metrics import confusion_matrix, classification_report, ConfusionMatrixDisplay
 from sklearn.neighbors import KDTree
@@ -21,8 +21,14 @@ import matplotlib.pyplot as plt
 # =========================
 # CONFIG
 # =========================
-DATASET_DIR = "../../FLANGE_DATASET_labels2"
-CSV_PATH = os.path.join(DATASET_DIR, "flange_info_labels2.csv")
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+DATASET_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, "../../FLANGE_DATASET_labels"))
+CSV_PATH = os.path.join(DATASET_DIR, "flange_info_labels.csv")
+
+BEST_MODEL_PATH = os.path.join(SCRIPT_DIR, "best_pointnet2_model_random_sampling.pth")
+HISTORY_PATH = os.path.join(SCRIPT_DIR, "training_history_random_sampling.csv")
+
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 NUM_POINTS = 2048
@@ -35,6 +41,9 @@ PATCHES_PER_EPOCH_TEST = 200
 SEED = 42
 
 print("Using Device:", DEVICE)
+print("Dataset dir:", DATASET_DIR)
+print("CSV path:", CSV_PATH)
+print("Best model path:", BEST_MODEL_PATH)
 
 
 # =========================
@@ -44,7 +53,11 @@ def seed_everything(seed=42):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 seed_everything(SEED)
@@ -88,7 +101,11 @@ def prepare_dataset():
     print("\nClasses no teste:")
     print(test_df["Label"].value_counts())
 
-    return train_df.reset_index(drop=True), valid_df.reset_index(drop=True), test_df.reset_index(drop=True)
+    return (
+        train_df.reset_index(drop=True),
+        valid_df.reset_index(drop=True),
+        test_df.reset_index(drop=True),
+    )
 
 
 # =========================
@@ -118,7 +135,7 @@ def augment_patch(coords):
     coords = coords.copy()
 
     # jitter
-    coords += np.random.normal(0, 0.01, size=coords.shape)
+    coords += np.random.normal(0, 0.01, size=coords.shape).astype(np.float32)
 
     # rotation z
     theta = np.random.uniform(0, 2 * np.pi)
@@ -148,13 +165,17 @@ class LocalPatchDataset(Dataset):
         self.cache = {}
 
     def __len__(self):
-        return self.epoch_size
+        return self.epoch_size if self.train else max(self.epoch_size, len(self.df))
 
     def _load_cloud(self, rel_path):
         full_path = os.path.join(DATASET_DIR, rel_path)
 
         if full_path not in self.cache:
             coords = read_xyz_from_ply(full_path)
+
+            if len(coords) == 0:
+                raise ValueError(f"Arquivo vazio: {full_path}")
+
             tree = KDTree(coords)
             self.cache[full_path] = (coords, tree)
 
@@ -181,9 +202,6 @@ class LocalPatchDataset(Dataset):
 
         coords, tree = self._load_cloud(row["Arquivo_PLY"])
         label = int(row["Label"])
-
-        if len(coords) == 0:
-            raise ValueError(f"Arquivo vazio: {row['Arquivo_PLY']}")
 
         if self.train:
             center_idx = np.random.randint(0, len(coords))
@@ -214,17 +232,17 @@ def cloud_collate(batch):
 # POINTNET++ SIMPLIFICADO
 # =========================
 def square_distance(src, dst):
-    B, N, C = src.shape
-    _, M, _ = dst.shape
     dist = -2 * torch.matmul(src, dst.transpose(1, 2))
-    dist += torch.sum(src ** 2, -1).unsqueeze(-1)
-    dist += torch.sum(dst ** 2, -1).unsqueeze(1)
+    dist += torch.sum(src ** 2, dim=-1).unsqueeze(-1)
+    dist += torch.sum(dst ** 2, dim=-1).unsqueeze(1)
     return dist
 
 
 def index_points(points, idx):
     B = points.shape[0]
-    batch_indices = torch.arange(B, dtype=torch.long).to(points.device).view(B, *((1,) * (idx.dim() - 1)))
+    batch_indices = torch.arange(B, dtype=torch.long, device=points.device).view(
+        B, *((1,) * (idx.dim() - 1))
+    )
     new_points = points[batch_indices, idx, :]
     return new_points
 
@@ -233,18 +251,19 @@ def farthest_point_sample(xyz, npoint):
     device = xyz.device
     B, N, C = xyz.shape
     npoint = min(npoint, N)
-    centroids = torch.zeros(B, npoint, dtype=torch.long).to(device)
-    distance = torch.ones(B, N).to(device) * 1e10
-    farthest = torch.randint(0, N, (B,), dtype=torch.long).to(device)
-    batch_indices = torch.arange(B, dtype=torch.long).to(device)
+
+    centroids = torch.zeros(B, npoint, dtype=torch.long, device=device)
+    distance = torch.ones(B, N, device=device) * 1e10
+    farthest = torch.randint(0, N, (B,), dtype=torch.long, device=device)
+    batch_indices = torch.arange(B, dtype=torch.long, device=device)
 
     for i in range(npoint):
         centroids[:, i] = farthest
         centroid = xyz[batch_indices, farthest, :].view(B, 1, C)
-        dist = torch.sum((xyz - centroid) ** 2, -1)
+        dist = torch.sum((xyz - centroid) ** 2, dim=-1)
         mask = dist < distance
         distance[mask] = dist[mask]
-        farthest = torch.max(distance, -1)[1]
+        farthest = torch.max(distance, dim=-1)[1]
 
     return centroids
 
@@ -252,18 +271,21 @@ def farthest_point_sample(xyz, npoint):
 def sample_and_group_all(xyz, points):
     device = xyz.device
     B, N, C = xyz.shape
-    new_xyz = torch.zeros(B, 1, C).to(device)
+    new_xyz = torch.zeros(B, 1, C, device=device)
     grouped_xyz = xyz.view(B, 1, N, C)
+
     if points is not None:
         grouped_points = points.view(B, 1, N, -1)
         new_points = torch.cat([grouped_xyz, grouped_points], dim=-1)
     else:
         new_points = grouped_xyz
+
     return new_xyz, new_points
 
 
 def sample_and_group(npoint, radius, nsample, xyz, points):
     B, N, C = xyz.shape
+
     if npoint is None:
         npoint = N
     else:
@@ -271,9 +293,11 @@ def sample_and_group(npoint, radius, nsample, xyz, points):
 
     fps_idx = farthest_point_sample(xyz, npoint)
     new_xyz = index_points(xyz, fps_idx)
+
     sqrdists = square_distance(new_xyz, xyz)
     nsample = min(nsample, N)
     group_idx = sqrdists.argsort()[:, :, :nsample]
+
     grouped_xyz = index_points(xyz, group_idx)
     grouped_xyz_norm = grouped_xyz - new_xyz.unsqueeze(2)
 
@@ -304,16 +328,19 @@ class PointNetSetAbstraction(nn.Module):
 
     def forward(self, xyz, points):
         if self.npoint is not None:
-            new_xyz, new_points = sample_and_group(self.npoint, self.radius, self.nsample, xyz, points)
+            new_xyz, new_points = sample_and_group(
+                self.npoint, self.radius, self.nsample, xyz, points
+            )
         else:
             new_xyz, new_points = sample_and_group_all(xyz, points)
 
         new_points = new_points.permute(0, 3, 1, 2)
+
         for i, conv in enumerate(self.mlp_convs):
             bn = self.mlp_bns[i]
             new_points = F.relu(bn(conv(new_points)))
 
-        new_points = torch.max(new_points, -1)[0]
+        new_points = torch.max(new_points, dim=-1)[0]
         new_points = new_points.permute(0, 2, 1)
         return new_xyz, new_points
 
@@ -321,9 +348,15 @@ class PointNetSetAbstraction(nn.Module):
 class PointNet2Classifier(nn.Module):
     def __init__(self, num_classes=2):
         super().__init__()
-        self.sa1 = PointNetSetAbstraction(npoint=512, radius=0.2, nsample=32, in_channel=3, mlp=[64, 64, 128])
-        self.sa2 = PointNetSetAbstraction(npoint=128, radius=0.4, nsample=64, in_channel=128 + 3, mlp=[128, 128, 256])
-        self.sa3 = PointNetSetAbstraction(npoint=None, radius=None, nsample=None, in_channel=256 + 3, mlp=[256, 512, 1024])
+        self.sa1 = PointNetSetAbstraction(
+            npoint=512, radius=0.2, nsample=32, in_channel=3, mlp=[64, 64, 128]
+        )
+        self.sa2 = PointNetSetAbstraction(
+            npoint=128, radius=0.4, nsample=64, in_channel=128 + 3, mlp=[128, 128, 256]
+        )
+        self.sa3 = PointNetSetAbstraction(
+            npoint=None, radius=None, nsample=None, in_channel=256 + 3, mlp=[256, 512, 1024]
+        )
 
         self.fc1 = nn.Linear(1024, 512)
         self.bn1 = nn.BatchNorm1d(512)
@@ -341,7 +374,7 @@ class PointNet2Classifier(nn.Module):
         l2_xyz, l2_points = self.sa2(l1_xyz, l1_points)
         _, l3_points = self.sa3(l2_xyz, l2_points)
 
-        x = l3_points.view(xyz.shape[0], -1)
+        x = l3_points.reshape(xyz.shape[0], -1)
         x = self.drop1(F.relu(self.bn1(self.fc1(x))))
         x = self.drop2(F.relu(self.bn2(self.fc2(x))))
         x = self.fc3(x)
@@ -417,31 +450,39 @@ def plot_confusion_matrix(model, loader, device, class_names):
     disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=class_names)
     disp.plot()
     plt.show()
-    print(classification_report(all_labels, all_preds, target_names=class_names))
+
+    print(
+        classification_report(
+            all_labels,
+            all_preds,
+            target_names=class_names,
+            zero_division=0
+        )
+    )
 
 
 def train_model():
     train_df, valid_df, test_df = prepare_dataset()
 
     train_dataset = LocalPatchDataset(
-        train_df, num_points=NUM_POINTS, epoch_size=PATCHES_PER_EPOCH_TRAIN, train=True
+        train_df,
+        num_points=NUM_POINTS,
+        epoch_size=PATCHES_PER_EPOCH_TRAIN,
+        train=True
     )
     valid_dataset = LocalPatchDataset(
-        valid_df, num_points=NUM_POINTS, epoch_size=PATCHES_PER_EPOCH_VALID, train=False
+        valid_df,
+        num_points=NUM_POINTS,
+        epoch_size=PATCHES_PER_EPOCH_VALID,
+        train=False
     )
     test_dataset = LocalPatchDataset(
-        test_df, num_points=NUM_POINTS, epoch_size=PATCHES_PER_EPOCH_TEST, train=False
+        test_df,
+        num_points=NUM_POINTS,
+        epoch_size=PATCHES_PER_EPOCH_TEST,
+        train=False
     )
 
-    class_counts = train_df["Label"].value_counts().sort_index()
-    class_weights = 1.0 / class_counts
-    samples_weight = train_df["Label"].apply(lambda x: class_weights[x]).values
-    samples_weight = torch.from_numpy(samples_weight).float()
-
-    # sampler no nível dos arquivos-base
-    sampler = WeightedRandomSampler(samples_weight, len(samples_weight), replacement=True)
-
-    # loader de treino com amostragem normal do dataset virtual
     train_loader = DataLoader(
         train_dataset,
         batch_size=BATCH_SIZE,
@@ -468,17 +509,22 @@ def train_model():
 
     model = PointNet2Classifier(num_classes=2).to(DEVICE)
 
+    class_counts = train_df["Label"].value_counts().sort_index()
+    count_0 = int(class_counts.get(0, 1))
+    count_1 = int(class_counts.get(1, 1))
+
     weight_tensor = torch.tensor(
-        [1.0, class_counts[0] / class_counts[1]],
-        dtype=torch.float32
-    ).to(DEVICE)
+        [1.0, count_0 / max(count_1, 1)],
+        dtype=torch.float32,
+        device=DEVICE
+    )
 
     criterion = nn.CrossEntropyLoss(weight=weight_tensor)
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.5)
 
-    best_acc = 0.0
-    best_model = None
+    best_acc = -1.0
+    best_model = copy.deepcopy(model)
 
     history = {
         "epoch": [],
@@ -507,12 +553,18 @@ def train_model():
         if valid_acc > best_acc:
             best_acc = valid_acc
             best_model = copy.deepcopy(model)
-            torch.save(best_model.state_dict(), "best_pointnet2_model_random_sampling.pth")
-            print("Model saved!")
+            torch.save(best_model.state_dict(), BEST_MODEL_PATH)
+            print(f"Model saved at: {BEST_MODEL_PATH}")
 
-    pd.DataFrame(history).to_csv("training_history_random_sampling.csv", index=False)
+    pd.DataFrame(history).to_csv(HISTORY_PATH, index=False)
+    print(f"Training history saved at: {HISTORY_PATH}")
 
-    best_model.load_state_dict(torch.load("best_pointnet2_model_random_sampling.pth", map_location=DEVICE))
+    if not os.path.exists(BEST_MODEL_PATH):
+        raise FileNotFoundError(f"Modelo não encontrado em: {BEST_MODEL_PATH}")
+
+    best_model.load_state_dict(torch.load(BEST_MODEL_PATH, map_location=DEVICE))
+    best_model.to(DEVICE)
+
     test_loss, test_acc = eval_epoch(best_model, test_loader, criterion, DEVICE)
     print(f"\nTest Loss: {test_loss:.4f}, Test Acc: {test_acc:.2f}%")
 

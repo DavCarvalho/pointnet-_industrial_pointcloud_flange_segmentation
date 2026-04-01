@@ -1,23 +1,27 @@
 """
-POINTNET++ SEMANTIC SEGMENTATION — LABELS DATASET
-===================================================
+POINTNET++ SEMANTIC SEGMENTATION — v4 (CARREGA .NPZ PRÉ-PROCESSADOS)
+=====================================================================
 Segmentação semântica ponto a ponto de flanges em nuvens de pontos industriais.
-Usa os PLY originais com scalar_Classification (0=equipamento, 1=flange).
-Split por equipamento para evitar vazamento de dados.
 
-Adaptado para usar o dataset baseado em labels diretos (sem HDBSCAN).
+MUDANÇAS vs versão anterior:
+  1. Carrega dos .npz pré-processados (features, labels, índices já prontos)
+     → Sem recalcular normais/curvatura a cada load (era o gargalo de memória)
+  2. CLASS_WEIGHT_FLANGE reduzido (3-5x ao invés de 50x)
+     → Os dados agora já têm ~20% flange, não precisa compensar tanto
+  3. FLANGE_RATIO no sampler reduzido (0.3 ao invés de 0.4)
+     → Combinado com o rebalanceamento dos dados, evita over-fitting em flange
+  4. Scheduler CosineAnnealing ao invés de StepLR
+     → Convergência mais suave
 """
 
 import os
 import sys
 import random
 import copy
-import csv
 import time
 import numpy as np
 import pandas as pd
 from glob import glob
-from plyfile import PlyData
 
 import torch
 import torch.nn as nn
@@ -25,8 +29,7 @@ import torch.optim as optim
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
-from sklearn.metrics import confusion_matrix, classification_report
-from sklearn.neighbors import KDTree
+from sklearn.metrics import confusion_matrix
 from tqdm.auto import tqdm
 import matplotlib
 matplotlib.use("Agg")
@@ -39,33 +42,39 @@ import matplotlib.pyplot as plt
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# Diretório com os PLY originais (cada arquivo = 1 equipamento com labels)
-DATA_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, "../../DATA"))
+# Diretório com os .npz pré-processados (saída do preprocess v5)
+DATA_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, "../../DATA_PREPROCESSED_v5"))
 
 # Saídas
-MODEL_PATH = os.path.join(SCRIPT_DIR, "best_segmentation_labels.pth")
-HISTORY_PATH = os.path.join(SCRIPT_DIR, "segmentation_history_labels.csv")
-CM_PATH = os.path.join(SCRIPT_DIR, "segmentation_cm_labels.png")
-REPORT_PATH = os.path.join(SCRIPT_DIR, "segmentation_report_labels.txt")
-CURVES_PATH = os.path.join(SCRIPT_DIR, "segmentation_curves_labels.png")
+MODEL_PATH = os.path.join(SCRIPT_DIR, "best_segmentation_v5.pth")
+HISTORY_PATH = os.path.join(SCRIPT_DIR, "segmentation_history_v5.csv")
+CM_PATH = os.path.join(SCRIPT_DIR, "segmentation_cm_v5.png")
+REPORT_PATH = os.path.join(SCRIPT_DIR, "segmentation_report_v5.txt")
+CURVES_PATH = os.path.join(SCRIPT_DIR, "segmentation_curves_v5.png")
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Hiperparâmetros
-NUM_POINTS = 8192          # pontos por amostra (maior que classificação)
-BATCH_SIZE = 2             # menor porque cada sample é grande
+# ┌─────────────────────────────────────────────────────────────┐
+# │  HIPERPARÂMETROS AJUSTADOS                                  │
+# │                                                             │
+# │  A ideia: os dados já vêm com ~20% flange (do preprocess   │
+# │  v4 com ratio=4). Então NÃO precisamos de compensação       │
+# │  agressiva na loss nem no sampler.                          │
+# │                                                             │
+# │  CLASS_WEIGHT_FLANGE = 3.0 (era 50!)                        │
+# │    → Dados já rebalanceados, peso leve basta                │
+# │  FLANGE_RATIO = 0.3 (era 0.4)                              │
+# │    → Garante ver flange, mas sem dominar                    │
+# └─────────────────────────────────────────────────────────────┘
+NUM_POINTS = 8192
+BATCH_SIZE = 2
 NUM_EPOCHS = 200
 LEARNING_RATE = 1e-3
 WEIGHT_DECAY = 1e-5
 EARLY_STOP_PATIENCE = 30
-FLANGE_RATIO = 0.4         # fração mínima de pontos flange por amostra
-CLASS_WEIGHT_FLANGE = 50.0  # peso da classe flange na loss
+FLANGE_RATIO = 0.3           # fração de flanges por amostra (era 0.4)
+CLASS_WEIGHT_FLANGE = 3.0    # peso da classe flange na loss (era 50!)
 SEED = 42
-
-# Features: xyz + normals + curvature + rgb + intensity = 11 canais
-# (xyz é separado, então input_channels = 8)
-USE_RGB = True
-USE_INTENSITY = True
 
 CLASS_NAMES = ["equipment", "flange"]
 
@@ -91,178 +100,35 @@ seed_everything(SEED)
 
 
 # ╔══════════════════════════════════════════════════════════════╗
-# ║                   LEITURA DE DADOS                           ║
-# ╚══════════════════════════════════════════════════════════════╝
-
-CLASS_FIELD_CANDIDATES = [
-    "scalar_Classification", "scalar_classification",
-    "Classification", "classification",
-    "label", "scalar_Label", "class"
-]
-
-
-def find_class_field(vertex_properties):
-    prop_names = [p.name for p in vertex_properties]
-    for name in CLASS_FIELD_CANDIDATES:
-        if name in prop_names:
-            return name
-    raise ValueError(f"Campo de classificação não encontrado. Campos: {prop_names}")
-
-
-def read_ply_with_features(filepath):
-    """Lê PLY e retorna coords, features extras e labels."""
-    plydata = PlyData.read(filepath)
-    vertex = plydata["vertex"].data
-    prop_names = [p.name for p in plydata["vertex"].properties]
-
-    # Coordenadas XYZ
-    x = np.array(vertex["x"], dtype=np.float32)
-    y = np.array(vertex["y"], dtype=np.float32)
-    z = np.array(vertex["z"], dtype=np.float32)
-    xyz = np.column_stack([x, y, z])
-
-    # Labels
-    class_field = find_class_field(plydata["vertex"].properties)
-    labels = np.array(vertex[class_field], dtype=np.int32)
-
-    # RGB (se disponível)
-    rgb = None
-    if USE_RGB:
-        if "red" in prop_names and "green" in prop_names and "blue" in prop_names:
-            r = np.array(vertex["red"], dtype=np.float32)
-            g = np.array(vertex["green"], dtype=np.float32)
-            b = np.array(vertex["blue"], dtype=np.float32)
-            rgb = np.column_stack([r, g, b])
-
-    # Intensidade (se disponível)
-    intensity = None
-    if USE_INTENSITY and "intensity" in prop_names:
-        intensity = np.array(vertex["intensity"], dtype=np.float32).reshape(-1, 1)
-
-    return xyz, labels, rgb, intensity
-
-
-def estimate_normals_and_curvature(xyz, k=16):
-    """Estima normais e curvatura local via Open3D (C++ otimizado)."""
-    import open3d as o3d
-
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(xyz.astype(np.float64))
-
-    # Estimar normais com KNN (mesmo método PCA, mas em C++)
-    pcd.estimate_normals(
-        search_param=o3d.geometry.KDTreeSearchParamKNN(knn=k)
-    )
-    # Orientar normais de forma consistente
-    try:
-        pcd.orient_normals_consistent_tangent_plane(k=k)
-    except RuntimeError:
-        pass  # pode falhar em nuvens muito esparsas, normais ficam OK
-
-    normals = np.asarray(pcd.normals, dtype=np.float32)
-
-    # Curvatura via sklearn KDTree (batch, muito mais rápido que loop)
-    tree = KDTree(xyz)
-    N = xyz.shape[0]
-    curvature = np.zeros((N, 1), dtype=np.float32)
-
-    block_size = 10000
-    for start in range(0, N, block_size):
-        end = min(start + block_size, N)
-        idx = tree.query(xyz[start:end], k=k, return_distance=False)
-
-        for i_local, i_global in enumerate(range(start, end)):
-            neighbors = xyz[idx[i_local]]
-            centered = neighbors - np.mean(neighbors, axis=0)
-            cov = centered.T @ centered
-            eigvals = np.linalg.eigvalsh(cov)
-            curvature[i_global] = eigvals[0] / (np.sum(eigvals) + 1e-8)
-
-    return normals, curvature
-
-
-def normalize_xyz_unit_sphere(xyz):
-    """
-    Centraliza em torno da origem e escala pela maior distância ao centro.
-    Mantém a geometria consistente para o PointNet++.
-    """
-    xyz = xyz.astype(np.float32)
-    center = np.mean(xyz, axis=0, keepdims=True)
-    xyz = xyz - center
-
-    radius = np.max(np.linalg.norm(xyz, axis=1))
-    if radius < 1e-8:
-        radius = 1.0
-
-    xyz = xyz / radius
-    return xyz.astype(np.float32)
-
-
-def normalize_scalar_channel(x):
-    """
-    Normaliza 1 canal escalar por z-score.
-    """
-    x = x.astype(np.float32)
-    mean = np.mean(x, axis=0, keepdims=True)
-    std = np.std(x, axis=0, keepdims=True) + 1e-8
-    return ((x - mean) / std).astype(np.float32)
-
-
-def build_features(xyz_centered, normals, curvature, rgb, intensity):
-    """
-    Monta as features do jeito certo:
-    - xyz: normalização geométrica (unit sphere)
-    - normals: mantém como vetor direcional e renormaliza módulo
-    - curvature/rgb/intensity: normalização por canal
-    """
-    # XYZ geométrico
-    xyz_geom = normalize_xyz_unit_sphere(xyz_centered)
-
-    # Normais: garantir módulo ~1
-    normals = normals.astype(np.float32)
-    normals_norm = np.linalg.norm(normals, axis=1, keepdims=True) + 1e-8
-    normals = normals / normals_norm
-
-    # Curvatura
-    curvature = normalize_scalar_channel(curvature)
-
-    # RGB
-    if rgb is None:
-        rgb = np.zeros((len(xyz_centered), 3), dtype=np.float32)
-    else:
-        rgb = rgb.astype(np.float32)
-        # Se vier 0..255, joga para 0..1
-        if np.max(rgb) > 1.5:
-            rgb = rgb / 255.0
-
-    # Intensidade
-    if intensity is None:
-        intensity = np.zeros((len(xyz_centered), 1), dtype=np.float32)
-    else:
-        intensity = normalize_scalar_channel(intensity)
-
-    features = np.concatenate(
-        [xyz_geom, normals, curvature, rgb, intensity],
-        axis=1
-    ).astype(np.float32)
-
-    return features
-
-
-# ╔══════════════════════════════════════════════════════════════╗
-# ║                   SPLIT POR EQUIPAMENTO                      ║
+# ║                SPLIT POR EQUIPAMENTO                         ║
 # ╚══════════════════════════════════════════════════════════════╝
 
 def split_equipment_files(data_dir, seed=42):
-    """Divide os arquivos PLY em treino/validação/teste por equipamento."""
-    ply_files = sorted(glob(os.path.join(data_dir, "*.ply")))
-    if not ply_files:
-        raise FileNotFoundError(f"Nenhum arquivo PLY encontrado em {data_dir}")
+    """Divide os arquivos .npz em treino/validação/teste por equipamento."""
+    npz_files = sorted(glob(os.path.join(data_dir, "*.npz")))
+    if not npz_files:
+        raise FileNotFoundError(f"Nenhum arquivo .npz encontrado em {data_dir}")
 
-    print(f"Total de equipamentos (PLY): {len(ply_files)}")
+    print(f"\nTotal de equipamentos (.npz): {len(npz_files)}")
+
+    # Mostrar estatísticas de cada arquivo
+    total_flange = 0
+    total_equip = 0
+    for f in npz_files:
+        data = np.load(f)
+        n_f = len(data["flange_idx"])
+        n_e = len(data["equip_idx"])
+        total_flange += n_f
+        total_equip += n_e
+        pct = 100 * n_f / (n_f + n_e)
+        print(f"  {os.path.basename(f):30s} "
+              f"total={n_f+n_e:>8,} flange={pct:.1f}%")
+
+    total = total_flange + total_equip
+    print(f"\n  GLOBAL: {total:,} pontos, {100*total_flange/total:.1f}% flange")
 
     rng = np.random.default_rng(seed)
-    indices = np.arange(len(ply_files))
+    indices = np.arange(len(npz_files))
     rng.shuffle(indices)
 
     n = len(indices)
@@ -270,11 +136,15 @@ def split_equipment_files(data_dir, seed=42):
     n_valid = max(1, int(n * 0.10))
     n_train = n - n_test - n_valid
 
-    train_files = [ply_files[i] for i in indices[:n_train]]
-    valid_files = [ply_files[i] for i in indices[n_train:n_train + n_valid]]
-    test_files = [ply_files[i] for i in indices[n_train + n_valid:]]
+    train_files = [npz_files[i] for i in indices[:n_train]]
+    valid_files = [npz_files[i] for i in indices[n_train:n_train + n_valid]]
+    test_files = [npz_files[i] for i in indices[n_train + n_valid:]]
 
-    print(f"Train: {len(train_files)}, Valid: {len(valid_files)}, Test: {len(test_files)}")
+    print(f"\nSplit: Train={len(train_files)}, Valid={len(valid_files)}, Test={len(test_files)}")
+    for label, files in [("Train", train_files), ("Valid", valid_files), ("Test", test_files)]:
+        names = [os.path.basename(f).replace('.npz', '') for f in files]
+        print(f"  {label}: {', '.join(names)}")
+
     return train_files, valid_files, test_files
 
 
@@ -284,14 +154,13 @@ def split_equipment_files(data_dir, seed=42):
 
 class SegmentationDataset(Dataset):
     """
-    Dataset para segmentação semântica.
-    Cada __getitem__ retorna um patch de NUM_POINTS pontos com features e labels.
-    Usa amostragem estratificada para garantir presença de flanges.
+    Dataset que carrega dos .npz pré-processados.
+    Sem recálculo de normais/curvatura — tudo já está pronto.
     """
 
-    def __init__(self, ply_files, num_points=8192, epoch_size=100,
-                 train=True, flange_ratio=0.4):
-        self.ply_files = ply_files
+    def __init__(self, npz_files, num_points=8192, epoch_size=100,
+                 train=True, flange_ratio=0.3):
+        self.npz_files = npz_files
         self.num_points = num_points
         self.epoch_size = epoch_size
         self.train = train
@@ -302,59 +171,30 @@ class SegmentationDataset(Dataset):
         return self.epoch_size
 
     def _load_equipment(self, filepath):
+        """Carrega do .npz — instantâneo, sem processamento pesado."""
         if filepath not in self.cache:
-            xyz, labels_raw, rgb, intensity = read_ply_with_features(filepath)
-
-            # Binarizar labels: 1=flange, tudo resto=0 (equipamento)
-            labels = np.where(labels_raw == 1, 1, 0).astype(np.int64)
-
-            # Centralizar coordenadas
-            mean_xyz = np.mean(xyz, axis=0, keepdims=True)
-            min_z = np.min(xyz[:, 2:3], axis=0, keepdims=True)
-            xyz_centered = xyz.copy()
-            xyz_centered[:, 0] -= mean_xyz[0, 0]
-            xyz_centered[:, 1] -= mean_xyz[0, 1]
-            xyz_centered[:, 2] -= min_z[0, 0]
-
-            # Estimar normais e curvatura
-            print(f"  Calculando normais/curvatura para {os.path.basename(filepath)}...")
-            normals, curvature = estimate_normals_and_curvature(xyz_centered, k=16)
-
-            # Montar features do jeito certo
-            features = build_features(
-                xyz_centered=xyz_centered,
-                normals=normals,
-                curvature=curvature,
-                rgb=rgb,
-                intensity=intensity
-            )
-
-            # Índices por classe
-            flange_idx = np.where(labels == 1)[0]
-            equip_idx = np.where(labels != 1)[0]
-
+            data = np.load(filepath)
             self.cache[filepath] = {
-                "features": features,
-                "labels": labels,
-                "flange_idx": flange_idx,
-                "equip_idx": equip_idx,
+                "features": data["features"],       # (N, 11)
+                "labels": data["labels"],            # (N,)
+                "flange_idx": data["flange_idx"],    # índices onde label==1
+                "equip_idx": data["equip_idx"],      # índices onde label==0
             }
-
-            n_flange = len(flange_idx)
-            n_equip = len(equip_idx)
-            print(f"    -> {n_flange} flange, {n_equip} equipamento "
-                  f"({100*n_flange/(n_flange+n_equip):.1f}% flange)")
-
+            n_f = len(data["flange_idx"])
+            n_e = len(data["equip_idx"])
+            print(f"  Carregado: {os.path.basename(filepath)} "
+                  f"({n_f:,} flange, {n_e:,} equip, "
+                  f"{100*n_f/(n_f+n_e):.1f}% flange)")
         return self.cache[filepath]
 
     def __getitem__(self, idx):
         # Escolher equipamento
         if self.train:
-            file_idx = np.random.randint(0, len(self.ply_files))
+            file_idx = np.random.randint(0, len(self.npz_files))
         else:
-            file_idx = idx % len(self.ply_files)
+            file_idx = idx % len(self.npz_files)
 
-        data = self._load_equipment(self.ply_files[file_idx])
+        data = self._load_equipment(self.npz_files[file_idx])
         features = data["features"]
         labels = data["labels"]
         flange_idx = data["flange_idx"]
@@ -365,7 +205,7 @@ class SegmentationDataset(Dataset):
         n_total = n_flange + n_equip
 
         if self.train:
-            # Treino: amostragem estratificada com flange_ratio
+            # Treino: amostragem estratificada
             if n_flange > 0 and self.flange_ratio is not None:
                 desired_flange = max(1, int(self.num_points * self.flange_ratio))
                 desired_equip = self.num_points - desired_flange
@@ -378,13 +218,15 @@ class SegmentationDataset(Dataset):
                 )
                 sampled = np.concatenate([sampled_flange, sampled_equip])
             else:
-                sampled = np.random.choice(n_total, self.num_points, replace=(n_total < self.num_points))
+                sampled = np.random.choice(n_total, self.num_points,
+                                           replace=(n_total < self.num_points))
             np.random.shuffle(sampled)
         else:
-            # Valid/test: distribuição natural, determinístico por idx
+            # Valid/test: distribuição natural, determinístico
             rng = np.random.default_rng(idx + SEED)
             all_idx = np.arange(n_total)
-            sampled = rng.choice(all_idx, self.num_points, replace=(n_total < self.num_points))
+            sampled = rng.choice(all_idx, self.num_points,
+                                 replace=(n_total < self.num_points))
 
         feat_sample = features[sampled]
         label_sample = labels[sampled]
@@ -414,15 +256,14 @@ class SegmentationDataset(Dataset):
         xyz = xyz @ rot.T
         normals = normals @ rot.T
 
-        # Renormalizar normais
         normals_norm = np.linalg.norm(normals, axis=1, keepdims=True) + 1e-8
         normals = normals / normals_norm
 
-        # Escala só no xyz
+        # Escala
         scale = np.random.uniform(0.9, 1.1)
         xyz *= scale
 
-        # Jitter só no xyz
+        # Jitter
         xyz += np.random.normal(0, 0.01, size=xyz.shape).astype(np.float32)
 
         features[:, :3] = xyz
@@ -432,13 +273,13 @@ class SegmentationDataset(Dataset):
 
 def seg_collate(batch):
     feats, labels = zip(*batch)
-    feats = torch.stack(feats, dim=0)    # (B, N, C)
-    labels = torch.stack(labels, dim=0)  # (B, N)
+    feats = torch.stack(feats, dim=0)
+    labels = torch.stack(labels, dim=0)
     return feats, labels
 
 
 # ╔══════════════════════════════════════════════════════════════╗
-# ║                POINTNET++ SEGMENTAÇÃO (Pure PyTorch)         ║
+# ║                POINTNET++ SEGMENTAÇÃO                        ║
 # ╚══════════════════════════════════════════════════════════════╝
 
 def square_distance(src, dst):
@@ -538,14 +379,13 @@ class SetAbstraction(nn.Module):
             new_xyz, new_points = sample_and_group_all(xyz, points)
             fps_idx = None
 
-        # (B, npoint, nsample, C) -> (B, C, npoint, nsample)
         new_points = new_points.permute(0, 3, 1, 2)
 
         for conv, bn in zip(self.convs, self.bns):
             new_points = F.relu(bn(conv(new_points)))
 
-        new_points = torch.max(new_points, dim=-1)[0]  # (B, C', npoint)
-        new_points = new_points.permute(0, 2, 1)       # (B, npoint, C')
+        new_points = torch.max(new_points, dim=-1)[0]
+        new_points = new_points.permute(0, 2, 1)
 
         return new_xyz, new_points, fps_idx
 
@@ -562,46 +402,37 @@ class FeaturePropagation(nn.Module):
             last_ch = out_ch
 
     def forward(self, xyz1, xyz2, points1, points2):
-        """
-        xyz1: (B, N, 3) — posições de maior resolução
-        xyz2: (B, S, 3) — posições de menor resolução
-        points1: (B, N, D1) — features skip connection
-        points2: (B, S, D2) — features a interpolar
-        """
         B, N, C = xyz1.shape
         _, S, _ = xyz2.shape
 
         if S == 1:
-            # Caso global: replicar para todos os pontos
             interpolated = points2.repeat(1, N, 1)
         else:
-            # Interpolação por distância (3 vizinhos mais próximos)
-            dists = square_distance(xyz1, xyz2)  # (B, N, S)
+            dists = square_distance(xyz1, xyz2)
             dists, idx = dists.sort(dim=-1)
             dists = dists[:, :, :3]
             idx = idx[:, :, :3]
 
             dist_recip = 1.0 / (dists + 1e-8)
             norm = torch.sum(dist_recip, dim=2, keepdim=True)
-            weight = dist_recip / norm  # (B, N, 3)
+            weight = dist_recip / norm
 
-            interpolated_points = index_points(points2, idx)  # (B, N, 3, D2)
+            interpolated_points = index_points(points2, idx)
             interpolated = torch.sum(
                 interpolated_points * weight.unsqueeze(-1), dim=2
-            )  # (B, N, D2)
+            )
 
         if points1 is not None:
             new_points = torch.cat([points1, interpolated], dim=-1)
         else:
             new_points = interpolated
 
-        # (B, N, D) -> (B, D, N)
         new_points = new_points.permute(0, 2, 1)
 
         for conv, bn in zip(self.convs, self.bns):
             new_points = F.relu(bn(conv(new_points)))
 
-        return new_points.permute(0, 2, 1)  # (B, N, D')
+        return new_points.permute(0, 2, 1)
 
 
 class PointNet2SegModel(nn.Module):
@@ -610,8 +441,6 @@ class PointNet2SegModel(nn.Module):
     def __init__(self, num_classes=2, input_channels=8):
         super().__init__()
 
-        # Encoder (Set Abstraction)
-        # input_channels = features extras (sem xyz, que são 3)
         self.sa1 = SetAbstraction(
             npoint=2048, nsample=32, in_channel=3 + input_channels, mlp=[64, 64, 128]
         )
@@ -625,7 +454,6 @@ class PointNet2SegModel(nn.Module):
             npoint=None, nsample=None, in_channel=3 + 512, mlp=[512, 512, 1024]
         )
 
-        # Attention
         self.attention = nn.Sequential(
             nn.Conv1d(1024, 512, 1),
             nn.BatchNorm1d(512),
@@ -634,7 +462,6 @@ class PointNet2SegModel(nn.Module):
             nn.Sigmoid()
         )
 
-        # Decoder (Feature Propagation)
         self.fp4 = FeaturePropagation(in_channel=1024 + 512, mlp=[512, 512])
         self.fp3 = FeaturePropagation(in_channel=512 + 256, mlp=[256, 256])
         self.fp2 = FeaturePropagation(in_channel=256 + 128, mlp=[128, 128])
@@ -642,7 +469,6 @@ class PointNet2SegModel(nn.Module):
             in_channel=128 + input_channels, mlp=[128, 128]
         )
 
-        # Segmentation head
         self.seg_head = nn.Sequential(
             nn.Conv1d(128, 128, 1),
             nn.BatchNorm1d(128),
@@ -652,14 +478,9 @@ class PointNet2SegModel(nn.Module):
         )
 
     def forward(self, features):
-        """
-        features: (B, N, C_total) onde C_total = 3(xyz) + input_channels
-        Retorna: (B, N, num_classes)
-        """
-        xyz = features[:, :, :3].contiguous()              # (B, N, 3)
-        extra_feats = features[:, :, 3:].contiguous()      # (B, N, input_channels)
+        xyz = features[:, :, :3].contiguous()
+        extra_feats = features[:, :, 3:].contiguous()
 
-        # Encoder
         l0_xyz = xyz
         l0_points = extra_feats
 
@@ -668,21 +489,18 @@ class PointNet2SegModel(nn.Module):
         l3_xyz, l3_points, _ = self.sa3(l2_xyz, l2_points)
         l4_xyz, l4_points, _ = self.sa4(l3_xyz, l3_points)
 
-        # Attention no nível global
-        attn_input = l4_points.permute(0, 2, 1)  # (B, C, 1)
+        attn_input = l4_points.permute(0, 2, 1)
         attn_weights = self.attention(attn_input)
         l4_points = (l4_points.permute(0, 2, 1) * attn_weights).permute(0, 2, 1)
 
-        # Decoder
         l3_points = self.fp4(l3_xyz, l4_xyz, l3_points, l4_points)
         l2_points = self.fp3(l2_xyz, l3_xyz, l2_points, l3_points)
         l1_points = self.fp2(l1_xyz, l2_xyz, l1_points, l2_points)
         l0_points = self.fp1(l0_xyz, l1_xyz, l0_points, l1_points)
 
-        # Segmentation head
-        x = l0_points.permute(0, 2, 1)  # (B, 128, N)
-        x = self.seg_head(x)             # (B, num_classes, N)
-        x = x.permute(0, 2, 1)           # (B, N, num_classes)
+        x = l0_points.permute(0, 2, 1)
+        x = self.seg_head(x)
+        x = x.permute(0, 2, 1)
 
         return x
 
@@ -692,7 +510,7 @@ class PointNet2SegModel(nn.Module):
 # ╚══════════════════════════════════════════════════════════════╝
 
 def focal_loss(pred, target, class_weights, gamma=2.0):
-    """Focal loss para lidar com desbalanceamento."""
+    """Focal loss para lidar com desbalanceamento residual."""
     pred_flat = pred.reshape(-1, pred.shape[-1])
     target_flat = target.reshape(-1)
     ce = F.cross_entropy(pred_flat, target_flat, reduction="none")
@@ -706,33 +524,16 @@ def dice_loss(pred, target, smooth=1.0):
     """Dice loss para melhorar sobreposição."""
     num_classes = pred.shape[-1]
     pred_soft = torch.softmax(pred, dim=-1)
+    target_oh = F.one_hot(target, num_classes).float()
 
-    target_oh = F.one_hot(target, num_classes).float()  # (B, N, C)
-
-    intersection = (pred_soft * target_oh).sum(dim=1)  # (B, C)
+    intersection = (pred_soft * target_oh).sum(dim=1)
     union = pred_soft.sum(dim=1) + target_oh.sum(dim=1)
     dice = (2.0 * intersection + smooth) / (union + smooth)
     return (1 - dice).mean()
 
 
-def boundary_loss(pred, target, boundary_weight=2.0):
-    """Penaliza erros nas bordas flange/equipamento."""
-    target_float = target.unsqueeze(1).float()  # (B, 1, N)
-    kernel = torch.ones(1, 1, 3, device=pred.device)
-    target_conv = F.conv1d(target_float, kernel, padding=1)
-    boundary = ((target_conv > 0) & (target_conv < 3)).squeeze(1).float()
-
-    ce = F.cross_entropy(
-        pred.reshape(-1, pred.shape[-1]),
-        target.reshape(-1),
-        reduction="none"
-    ).reshape(target.shape)
-
-    return (ce * boundary * boundary_weight).mean()
-
-
 def combined_loss(pred, target, class_weights):
-    """Combinação de focal + dice (sem boundary — pontos não têm ordem espacial)."""
+    """Combinação de focal + dice."""
     fl = focal_loss(pred, target, class_weights)
     dl = dice_loss(pred, target)
     return fl + dl
@@ -793,9 +594,13 @@ def train_epoch(model, loader, optimizer, class_weights, device):
         labels = labels.to(device)
 
         optimizer.zero_grad()
-        pred = model(feats)  # (B, N, 2)
+        pred = model(feats)
         loss = combined_loss(pred, labels, class_weights)
         loss.backward()
+
+        # Gradient clipping para estabilidade
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
         optimizer.step()
 
         total_loss += loss.item() * labels.size(0)
@@ -839,12 +644,10 @@ def eval_epoch(model, loader, class_weights, device):
 # ╚══════════════════════════════════════════════════════════════╝
 
 def plot_training_curves(history_path, save_path):
-    """Plota curvas de loss, OA e mIoU ao longo do treinamento."""
     df = pd.read_csv(history_path)
 
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
 
-    # Loss
     axes[0].plot(df["epoch"], df["train_loss"], label="Train", linewidth=1.5)
     axes[0].plot(df["epoch"], df["valid_loss"], label="Valid", linewidth=1.5)
     axes[0].set_xlabel("Epoch")
@@ -853,7 +656,6 @@ def plot_training_curves(history_path, save_path):
     axes[0].legend()
     axes[0].grid(True, alpha=0.3)
 
-    # OA
     axes[1].plot(df["epoch"], df["train_oa"], label="Train", linewidth=1.5)
     axes[1].plot(df["epoch"], df["valid_oa"], label="Valid", linewidth=1.5)
     axes[1].set_xlabel("Epoch")
@@ -862,7 +664,6 @@ def plot_training_curves(history_path, save_path):
     axes[1].legend()
     axes[1].grid(True, alpha=0.3)
 
-    # mIoU
     axes[2].plot(df["epoch"], df["train_miou"], label="Train", linewidth=1.5)
     axes[2].plot(df["epoch"], df["valid_miou"], label="Valid", linewidth=1.5)
     axes[2].set_xlabel("Epoch")
@@ -878,7 +679,6 @@ def plot_training_curves(history_path, save_path):
 
 
 def save_confusion_matrix(metrics, save_path):
-    """Salva a matriz de confusão como imagem."""
     from sklearn.metrics import ConfusionMatrixDisplay
 
     fig, ax = plt.subplots(figsize=(6, 6))
@@ -887,7 +687,7 @@ def save_confusion_matrix(metrics, save_path):
         display_labels=CLASS_NAMES
     )
     disp.plot(ax=ax, cmap="Blues", colorbar=False)
-    ax.set_title("Confusion Matrix — Segmentation")
+    ax.set_title("Confusion Matrix — Segmentation v5")
     plt.savefig(save_path, dpi=300, bbox_inches="tight")
     plt.close()
     print(f"Matriz de confusão salva em: {save_path}")
@@ -900,32 +700,32 @@ def save_confusion_matrix(metrics, save_path):
 def main():
     t_start = time.time()
 
+    # Verificar se DATA_DIR existe e tem .npz
+    if not os.path.exists(DATA_DIR):
+        print(f"ERRO: Diretório {DATA_DIR} não encontrado!")
+        print(f"Execute primeiro o preprocess_pointclouds_v4.py")
+        sys.exit(1)
+
     # Split por equipamento
     train_files, valid_files, test_files = split_equipment_files(DATA_DIR, seed=SEED)
 
-    # Calcular número de features
-    # xyz(3) + normals(3) + curvature(1) + rgb(3) + intensity(1) = 11
-    input_channels = 3 + 1  # normals + curvature
-    if USE_RGB:
-        input_channels += 3
-    if USE_INTENSITY:
-        input_channels += 1
-    # total = 8 (sem xyz)
-
+    # Features: xyz(3) + normals(3) + curvature(1) + rgb(3) + intensity(1) = 11
+    # input_channels = 11 - 3 (xyz) = 8
+    input_channels = 8
     print(f"\nInput channels (sem xyz): {input_channels}")
 
-    # Datasets
+    # Datasets — carrega dos .npz (instantâneo!)
     train_dataset = SegmentationDataset(
         train_files, num_points=NUM_POINTS,
         epoch_size=100, train=True, flange_ratio=FLANGE_RATIO
     )
     valid_dataset = SegmentationDataset(
         valid_files, num_points=NUM_POINTS,
-        epoch_size=50, train=False, flange_ratio=None  # distribuição natural
+        epoch_size=50, train=False, flange_ratio=None
     )
     test_dataset = SegmentationDataset(
         test_files, num_points=NUM_POINTS,
-        epoch_size=50, train=False, flange_ratio=None  # distribuição natural
+        epoch_size=50, train=False, flange_ratio=None
     )
 
     train_loader = DataLoader(
@@ -950,13 +750,18 @@ def main():
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Parâmetros do modelo: {n_params:,}")
 
-    # Loss weights
+    # Loss weights — REDUZIDO de 50 para 3
     class_weights = torch.tensor(
         [1.0, CLASS_WEIGHT_FLANGE], dtype=torch.float32, device=DEVICE
     )
+    print(f"Class weights: equip={class_weights[0]:.1f}, flange={class_weights[1]:.1f}")
 
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.5)
+
+    # CosineAnnealing ao invés de StepLR — convergência mais suave
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=NUM_EPOCHS, eta_min=1e-6
+    )
 
     # Training loop
     best_miou = -1.0
@@ -970,22 +775,22 @@ def main():
 
     print(f"\n{'='*60}")
     print(f"Iniciando treinamento — {NUM_EPOCHS} épocas")
+    print(f"  CLASS_WEIGHT_FLANGE = {CLASS_WEIGHT_FLANGE}")
+    print(f"  FLANGE_RATIO (sampler) = {FLANGE_RATIO}")
+    print(f"  Scheduler = CosineAnnealingLR")
     print(f"{'='*60}\n")
 
     for epoch in range(1, NUM_EPOCHS + 1):
-        # Train
         train_loss, train_oa, train_miou = train_epoch(
             model, train_loader, optimizer, class_weights, DEVICE
         )
 
-        # Validate
         valid_loss, valid_oa, valid_miou, _ = eval_epoch(
             model, valid_loader, class_weights, DEVICE
         )
 
         scheduler.step()
 
-        # Log
         history["epoch"].append(epoch)
         history["train_loss"].append(train_loss)
         history["train_oa"].append(train_oa)
@@ -1004,11 +809,12 @@ def main():
         else:
             no_improve += 1
 
+        lr_now = optimizer.param_groups[0]['lr']
         print(
             f"Epoch {epoch:3d}/{NUM_EPOCHS} | "
             f"Train: loss={train_loss:.4f} OA={train_oa:.1f}% mIoU={train_miou:.1f}% | "
-            f"Valid: loss={valid_loss:.4f} OA={valid_oa:.1f}% mIoU={valid_miou:.1f}%"
-            f"{improved}"
+            f"Valid: loss={valid_loss:.4f} OA={valid_oa:.1f}% mIoU={valid_miou:.1f}% | "
+            f"lr={lr_now:.2e}{improved}"
         )
 
         if no_improve >= EARLY_STOP_PATIENCE:
@@ -1019,7 +825,6 @@ def main():
     pd.DataFrame(history).to_csv(HISTORY_PATH, index=False)
     print(f"\nHistórico salvo em: {HISTORY_PATH}")
 
-    # Plotar curvas
     plot_training_curves(HISTORY_PATH, CURVES_PATH)
 
     # Avaliação final no teste
@@ -1039,10 +844,8 @@ def main():
     print(f"Test mIoU: {test_miou:.2f}%")
     test_metrics.print_report()
 
-    # Salvar confusion matrix
     save_confusion_matrix(test_metrics, CM_PATH)
 
-    # Salvar relatório
     ious = test_metrics.class_iou()
     with open(REPORT_PATH, "w") as f:
         f.write(f"Test Overall Accuracy: {test_oa:.2f}%\n")

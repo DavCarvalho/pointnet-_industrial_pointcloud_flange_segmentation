@@ -1,0 +1,21 @@
+Test Overall Accuracy: 93.83%
+Test mIoU: 84.89%
+
+Per-class IoU:
+  equipment: 92.15%
+  flange: 77.62%
+
+Confusion Matrix:
+[[296666   9472]
+ [ 15798  87664]]
+
+Hiperparâmetros:
+  NUM_POINTS: 8192
+  BATCH_SIZE: 2
+  NUM_EPOCHS: 200
+  LEARNING_RATE: 0.001
+  WEIGHT_DECAY: 1e-05
+  CLASS_WEIGHT_FLANGE: 3.0
+  FLANGE_RATIO: 0.3
+  SEED: 42
+  EARLY_STOP_PATIENCE: 30
