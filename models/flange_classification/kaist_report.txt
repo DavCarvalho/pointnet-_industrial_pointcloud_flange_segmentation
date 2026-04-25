@@ -1,0 +1,50 @@
+KAIST CLASSIFIER REPORT v4
+============================================================
+
+Classes: 17
+NUM_POINTS: 1024
+Best valid acc: 78.38%
+Test acc:       79.04%
+
+Per-class accuracy (test):
+  BlindFlange           95.5%
+  Cross                100.0%
+  Elbow 90              84.3%
+  Elbow non 90          83.3%
+  Flange                82.4%
+  Flange WN             40.2%
+  Olet                 100.0%
+  OrificeFlange        100.0%
+  Pipe                 100.0%
+  Reducer CONC          90.5%
+  Reducer ECC           85.7%
+  Reducer Insert         0.0%
+  Safety Valve         100.0%
+  Strainer              71.4%
+  Tee                   94.1%
+  Tee RED               93.8%
+  Valve                 94.1%
+
+                precision    recall  f1-score   support
+
+   BlindFlange       0.72      0.95      0.82        22
+         Cross       0.50      1.00      0.67         1
+      Elbow 90       0.97      0.84      0.90       115
+  Elbow non 90       0.83      0.83      0.83        18
+        Flange       0.47      0.82      0.60        51
+     Flange WN       0.83      0.40      0.54        87
+          Olet       1.00      1.00      1.00         1
+ OrificeFlange       1.00      1.00      1.00         1
+          Pipe       0.70      1.00      0.82         7
+  Reducer CONC       0.95      0.90      0.93        21
+   Reducer ECC       1.00      0.86      0.92         7
+Reducer Insert       0.00      0.00      0.00         1
+  Safety Valve       1.00      1.00      1.00         1
+      Strainer       0.62      0.71      0.67         7
+           Tee       0.67      0.94      0.78        34
+       Tee RED       0.88      0.94      0.91        16
+         Valve       0.98      0.94      0.96        68
+
+      accuracy                           0.79       458
+     macro avg       0.77      0.83      0.79       458
+  weighted avg       0.83      0.79      0.79       458

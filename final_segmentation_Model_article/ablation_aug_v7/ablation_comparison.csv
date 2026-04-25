@@ -1,0 +1,4 @@
+config,OA,mIoU,IoU_flange,IoU_equip,Precision_flange,Recall_flange,F1_flange,train_time_min
+no_aug,90.41,70.47,51.62,89.31,54.49,90.75,68.09,144.55
+light_aug,88.03,66.13,45.57,86.70,48.34,88.81,62.61,142.56
+heavy_aug,83.74,60.42,38.98,81.86,40.29,92.31,56.10,142.34

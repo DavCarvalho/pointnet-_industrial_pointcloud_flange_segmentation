@@ -1,0 +1,6 @@
+model,OA,mIoU,IoU_flange,IoU_equip,Precision_flange,Recall_flange,F1_flange,train_time_s,inference_time_s
+Random Forest,53.32,30.96,11.69,50.24,11.97,83.13,20.93,74.56,11.66
+Gradient Boosting,48.88,28.35,11.43,45.27,11.60,88.81,20.52,344.00,6.24
+Logistic Regression,39.26,22.16,8.89,35.43,9.10,79.77,16.33,0.56,1.36
+XGBoost,58.26,33.53,11.09,55.97,11.64,70.04,19.96,5.22,4.50
+PointNet++,91.61,65.68,40.25,91.11,46.10,76.02,57.40,,829.94

@@ -13,7 +13,7 @@ import sys
 import time
 import numpy as np
 from glob import glob
-
+import open3d as o3d
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -29,11 +29,11 @@ from sklearn.metrics import confusion_matrix
 # ╔══════════════════════════════════════════════════════════════╗
 # ║                      CONFIGURAÇÃO                           ║
 # ╚══════════════════════════════════════════════════════════════╝
-
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, "../../DATA_PREPROCESSED_v5"))
+# Caminho para sua pasta de arquivos crus
+DATA_CRU_DIR = r"C:\Users\davir\Desktop\industrial_pointcloud_segmentation\DATA_CRU"
 MODEL_PATH = os.path.join(SCRIPT_DIR, "best_segmentation_v6.pth")
-OUTPUT_DIR = os.path.join(SCRIPT_DIR, "article_figures_v6")
+OUTPUT_DIR = os.path.join(SCRIPT_DIR, "inference_results_cru")
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 NUM_POINTS = 8192
@@ -52,7 +52,45 @@ COLOR_FP = np.array([1.0, 0.8, 0.0])
 COLOR_OK = np.array([0.85, 0.85, 0.85])
 
 CLASS_NAMES = ["equipment", "flange"]
+INPUT_CHANNELS = 8
+# ╔══════════════════════════════════════════════════════════════╗
+# ║             PRÉ-PROCESSAMENTO DE ARQUIVOS PLY                ║
+# ╚══════════════════════════════════════════════════════════════╝
 
+def preprocess_ply(ply_path):
+    """
+    Carrega PLY e gera os 11 canais TOTAIS esperados pelo PointNet v6.
+    3 (XYZ) + 8 (Features Extras) = 11 colunas.
+    """
+    pcd = o3d.io.read_point_cloud(ply_path)
+    
+    # 1. Coordenadas XYZ (3 canais)
+    xyz = np.asarray(pcd.points)
+    xyz_centered = xyz - np.mean(xyz, axis=0)
+    
+    # 2. Normais (3 canais)
+    pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30))
+    normals = np.asarray(pcd.normals)
+    
+    # 3. Coordenadas Normalizadas (3 canais)
+    dist = np.max(np.sqrt(np.sum(xyz_centered**2, axis=1)), axis=0)
+    xyz_normalized = xyz_centered / (dist + 1e-8) # Evitar divisão por zero
+    
+    # 4. Padding / Preenchimento (2 canais)
+    # Como não temos intensidade ou curvatura no PLY cru, preenchemos com zeros
+    # para completar os 8 canais extras que o modelo espera.
+    N = xyz.shape[0]
+    dummy_features = np.zeros((N, 2))
+    
+    # Montando a matriz final: 3 + 3 + 3 + 2 = 11 colunas
+    features = np.concatenate([
+        xyz_centered,    # Colunas 0, 1, 2 (XYZ)
+        normals,         # Colunas 3, 4, 5 (Extra 1)
+        xyz_normalized,  # Colunas 6, 7, 8 (Extra 2)
+        dummy_features   # Colunas 9, 10   (Extra 3 - Padding)
+    ], axis=1)
+        
+    return features, xyz_centered
 
 # ╔══════════════════════════════════════════════════════════════╗
 # ║                      MODELO (GroupNorm)                      ║
@@ -361,71 +399,52 @@ def save_ply(xyz, colors, path):
 
 def main():
     t0 = time.time()
-    if not os.path.exists(MODEL_PATH):
-        print(f"ERRO: {MODEL_PATH} não encontrado"); sys.exit(1)
-
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    print("Carregando modelo v6 (GroupNorm)...")
-    model = PointNet2SegModel(num_classes=2, input_channels=8).to(DEVICE)
-    model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE, weights_only=False))
+    # Carregar Modelo
+    model = PointNet2SegModel(num_classes=2, input_channels=INPUT_CHANNELS).to(DEVICE)
+    if not os.path.exists(MODEL_PATH):
+        print(f"Erro: Modelo não encontrado em {MODEL_PATH}")
+        return
+    
+    model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
     model.eval()
-    print("OK")
 
-    npz_files = sorted(glob(os.path.join(DATA_DIR, "*.npz")))
-    print(f"Arquivos: {len(npz_files)}")
+    # Buscar arquivos .ply
+    ply_files = glob(os.path.join(DATA_CRU_DIR, "*.ply"))
+    print(f"Encontrados {len(ply_files)} arquivos crus.")
 
-    all_gt, all_pred, per_file = [], [], []
-
-    for fi, path in enumerate(npz_files):
+    for path in ply_files:
         name = os.path.splitext(os.path.basename(path))[0]
-        print(f"\n{'─'*50}\n[{fi+1}/{len(npz_files)}] {name}")
+        print(f"\nProcessando: {name}")
 
-        od = os.path.join(OUTPUT_DIR, name)
-        os.makedirs(od, exist_ok=True)
+        # Pre-processar
+        try:
+            features, xyz = preprocess_ply(path)
+        except Exception as e:
+            print(f"Erro ao ler {name}: {e}")
+            continue
 
-        data = np.load(path)
-        features, labels, xyz = data["features"], data["labels"], data["xyz_centered"]
-        nf, ne = int((labels==1).sum()), int((labels==0).sum())
-        print(f"  Pontos: {len(labels):,} (f={nf:,}, e={ne:,})")
+        # Inferência (usando sua função inference_full existente)
+        # Como é dado CRU, não temos labels (gt), então passamos None ou ignoramos métricas
+        pred, conf, _ = inference_full(model, features, num_points=8192, device=DEVICE)
 
-        t1 = time.time()
-        pred, conf, counts = inference_full(model, features, NUM_POINTS, NUM_VOTES, OVERLAP_FACTOR, DEVICE)
-        print(f"  Inferência: {time.time()-t1:.1f}s  Cobertura: {int((counts>0).sum()):,}/{len(counts):,}")
+        # Salvar Resultados
+        output_path = os.path.join(OUTPUT_DIR, f"{name}_segmented.ply")
+        
+        # Gerar cores para a predição
+        colors = lbl2col(pred) 
+        
+        # Salvar usando sua função save_ply
+        save_ply(xyz, colors, output_path)
+        
+        # Opcional: Salvar apenas o que o modelo acha que é FLANGE
+        flange_indices = np.where(pred == 1)[0]
+        if len(flange_indices) > 0:
+            flange_path = os.path.join(OUTPUT_DIR, f"{name}_ONLY_FLANGES.ply")
+            save_ply(xyz[flange_indices], colors[flange_indices], flange_path)
 
-        r = compute_metrics(labels, pred)
-        print_metrics(r, name)
-        all_gt.append(labels); all_pred.append(pred); per_file.append((name, r))
-
-        render_comparison(xyz, labels, pred, os.path.join(od, f"{name}_comparison.png"))
-        render_multi(xyz, pred, os.path.join(od, f"{name}_multi_angle.png"), name)
-        save_ply(xyz, lbl2col(pred), os.path.join(od, f"{name}_pred.ply"))
-        save_ply(xyz, err2col(labels, pred), os.path.join(od, f"{name}_errors.ply"))
-
-    # Global
-    print(f"\n{'='*60}\nGLOBAL\n{'='*60}")
-    gr = compute_metrics(np.concatenate(all_gt), np.concatenate(all_pred))
-    print_metrics(gr, "GLOBAL")
-
-    # Relatório
-    rp = os.path.join(OUTPUT_DIR, "inference_report.txt")
-    with open(rp, 'w', encoding='utf-8') as f:
-        f.write("INFERENCE REPORT — v6 (GroupNorm)\n" + "="*60 + "\n\n")
-        f.write(f"{'Equipment':<25s} {'OA':>6s} {'mIoU':>6s} {'Eq':>6s} {'Fl':>6s} "
-                f"{'FlP':>6s} {'FlR':>6s} {'FlF1':>6s}\n" + "─"*60 + "\n")
-        for name, r in per_file:
-            f.write(f"{name:<25s} {r['oa']:>5.1f}% {r['miou']:>5.1f}% "
-                    f"{r['iou']['equipment']:>5.1f}% {r['iou']['flange']:>5.1f}% "
-                    f"{r['prec']['flange']:>5.1f}% {r['rec']['flange']:>5.1f}% "
-                    f"{r['f1']['flange']:>5.1f}%\n")
-        f.write("─"*60 + "\n")
-        f.write(f"{'GLOBAL':<25s} {gr['oa']:>5.1f}% {gr['miou']:>5.1f}% "
-                f"{gr['iou']['equipment']:>5.1f}% {gr['iou']['flange']:>5.1f}% "
-                f"{gr['prec']['flange']:>5.1f}% {gr['rec']['flange']:>5.1f}% "
-                f"{gr['f1']['flange']:>5.1f}%\n")
-        f.write(f"\nCM:\n{gr['cm']}\n")
-    print(f"\nRelatório: {rp}")
-    print(f"Tempo: {(time.time()-t0)/60:.1f} min")
+    print(f"\nProcessamento concluído em {(time.time()-t0)/60:.2f} min")
 
 if __name__ == "__main__":
     main()

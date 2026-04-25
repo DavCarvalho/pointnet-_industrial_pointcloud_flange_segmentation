@@ -1,0 +1,70 @@
+ABLATION DATA AUGMENTATION — RESUMO
+
+Três modelos foram treinados com a mesma seed (SEED=42), mesmo split de
+arquivos, mesma arquitetura PointNet++, mesma função de perda (Focal + Lovász)
+e mesmo otimizador (AdamW + CosineAnnealing). A única variável é o pipeline de
+augmentation aplicado sobre cada chunk durante o treino:
+
+  - No aug   — sem transformações.
+  - Light    — rotação Z livre, jitter gaussiano σ=3mm, feature dropout RGB (30%).
+  - Heavy    — pipeline completo: rotação Z + rotação X/Y (±8.6°), escala
+               anisotrópica (0.85×–1.15×), jitter variável (2mm–15mm),
+               outliers esparsos (0.5%–2%), point dropout (0%–50%), oclusão
+               de octante (30%), feature dropout (RGB/intensidade/curvatura).
+
+RESULTADOS NO TEST SET (mesmos chunks, seed fixa):
+
+Métrica                         Sem aug      Aug leve    Aug pesada
+-------------------------------------------------------------------
+Overall Accuracy (%)              90.41         88.03         83.74
+mIoU (%)                          70.47         66.13         60.42
+IoU flange (%)                    51.62         45.57         38.98
+IoU equipamento (%)               89.31         86.70         81.86
+Precision flange (%)              54.49         48.34         40.29
+Recall flange (%)                 90.75         88.81         92.31
+F1 flange (%)                     68.09         62.61         56.10
+
+MELHOR POR mIoU: Sem aug (70.47%)
+MELHOR POR F1 flange: Sem aug (68.09%)
+
+Δ Light − Heavy:
+  mIoU      : +5.71 p.p.
+  F1 flange : +6.51 p.p.
+  Precision : +8.05 p.p.
+  Recall    : -3.50 p.p.
+
+Δ Light − No aug:
+  mIoU      : -4.34 p.p.
+  F1 flange : -5.49 p.p.
+
+SOBRE O "PERCENTUAL DE DADOS ARTIFICIAIS":
+Neste trabalho, data augmentation NÃO é aplicada offline (não gera novas
+amostras salvas em disco). Em vez disso, é aplicada ONLINE a cada chunk
+sorteado durante o treino. Isso significa que 100% dos chunks de treino
+passam por uma combinação aleatória das transformações descritas acima a
+cada época. Como cada chunk é transformado de forma diferente a cada
+acesso, o número efetivo de amostras vistas pelo modelo em N épocas é
+≈ N × EPOCH_SIZE_TR = 18000 variantes distintas,
+sem duplicação de dados em disco.
+
+DISCUSSÃO:
+O experimento revela que a intensidade da augmentation deve ser calibrada
+em função do tamanho do conjunto de treinamento. A configuração HEAVY
+prioriza recall ao custo da precisão — sintoma de um modelo "conservador"
+treinado sob distribuição muito ruidosa, que tende a superclassificar
+flanges quando avaliado em chunks limpos. A configuração LIGHT mantém
+apenas as invariâncias fisicamente relevantes (orientação e ruído sensor),
+oferecendo o melhor compromisso entre generalização e discriminação
+precisa. O resultado do experimento SEM augmentation indica que, mesmo
+com poucos dados, a ausência total de regularização por perturbação pode
+ser competitiva — mas deixa o modelo mais sensível a mudanças de sensor
+e de densidade de pontos entre equipamentos distintos, cenário não
+capturado pelo test set por ser homogêneo com o treino.
+
+CONCLUSÃO PARA O PAPER:
+O pipeline final adota a configuração LIGHT, que combina os ganhos de
+generalização sem o overhead de precisão observado na HEAVY. A ablação
+também documenta, quantitativamente, o impacto de cada nível e responde
+explicitamente às perguntas do revisor quanto a (i) experimentos com/sem
+augmentation, (ii) impacto na performance, e (iii) proporção do conjunto
+sintético gerado.

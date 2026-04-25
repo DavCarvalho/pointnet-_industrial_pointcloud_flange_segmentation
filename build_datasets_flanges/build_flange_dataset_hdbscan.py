@@ -8,7 +8,7 @@ import hdbscan
 # =========================
 # CONFIG
 # =========================
-DATA_DIR = "./DATA"
+DATA_DIR = "../DATA"
 OUT_DIR = "./FLANGE_DATASET"
 
 MIN_POINTS_FLANGE = 500
