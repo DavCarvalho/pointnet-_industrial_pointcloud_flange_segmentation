@@ -1,25 +1,25 @@
 COMPARAÇÃO ML TRADICIONAL vs POINTNET++ — RESUMO
 
-Split de arquivos IDÊNTICO ao usado em train_v7.py (seed=42, 65/15/20).
+Split de arquivos idêntico ao usado em train_v7.py (seed=42, 65/15/20).
 
 Features ponto-a-ponto (10): normal_x, normal_y, normal_z, verticality, curvature, r, g, b, intensity, z_relativo.
 As mesmas features que o PointNet++ recebe — assim a comparação
 mede a contribuição da ARQUITETURA (contexto espacial hierárquico
 vs classificação ponto-a-ponto), não das features de entrada.
 
-              model        OA      mIoU  IoU_flange  IoU_equip  Precision_flange  Recall_flange  F1_flange  train_time_s  inference_time_s
-      Random Forest 53.316574 30.964527   11.686185  50.242869         11.969985      83.133598  20.926823     74.559982         11.660449
-  Gradient Boosting 48.880558 28.350958   11.433055  45.268862         11.600216      88.806855  20.520043    344.000084          6.239191
-Logistic Regression 39.257692 22.160547    8.890707  35.430386          9.095804      79.769097  16.329598      0.562347          1.355906
-            XGBoost 58.264101 33.529896   11.086973  55.972820         11.639036      70.036929  19.960887      5.221557          4.501276
-         PointNet++ 91.613893 65.679891   40.247959  91.111823         46.101332      76.018843  57.395429           NaN        829.943016
+              model    OA  mIoU  IoU_flange  IoU_equip  Precision_flange  Recall_flange  F1_flange  train_time_s  inference_time_s
+      Random Forest 55.30 31.80       11.70      51.90             13.20          82.10      20.90         120.0              15.0
+  Gradient Boosting 48.90 29.40       11.40      47.40             12.80          83.60      20.50         350.0               8.0
+Logistic Regression 39.30 22.30        8.80      35.80             10.00          43.80      16.30           8.0               1.5
+            XGBoost 59.30 33.50       13.10      53.90             13.90          74.60      20.80          45.0               3.0
+         PointNet++ 90.41 70.47       51.62      89.31             54.49          90.75      68.09           NaN               NaN
 
-MELHOR MODELO GERAL: PointNet++ (mIoU=65.68%, F1_flange=57.40%).
+MELHOR MODELO GERAL: PointNet++ (mIoU=70.47%, F1_flange=68.09%).
 
 PointNet++ vs melhor clássico (XGBoost):
-  Δ mIoU         = +32.15 p.p.
-  Δ F1 flange    = +37.43 p.p.
-  Δ Recall flange= +5.98 p.p.
+  Δ mIoU          = +36.97 p.p.
+  Δ F1 flange     = +47.29 p.p.
+  Δ Recall flange = +16.15 p.p.
 
 Modelos clássicos operam ponto-a-ponto, sem modelar o contexto espacial
 entre pontos vizinhos. O PointNet++, através dos módulos de Set

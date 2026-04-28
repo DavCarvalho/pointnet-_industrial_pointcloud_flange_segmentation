@@ -1,0 +1,35 @@
+DISTRIBUIÇÃO DE CLASSES — RESUMO
+
+Total de equipamentos: 28
+Total de pontos (após voxel 5mm): 69.418.584
+  Flange:      2.558.520 (3.69%)
+  Equipamento: 66.860.064 (96.31%)
+  Razão equipamento:flange ≈ 1:26
+
+Por conjunto:
+  treino     19 eq |    59.727.318 pts | flange:  3.20% | razão 1:30
+  validacao   4 eq |     4.786.189 pts | flange:  5.92% | razão 1:16
+  teste       5 eq |     4.905.077 pts | flange:  7.43% | razão 1:12
+
+TRECHO LATEX SUGERIDO PARA A SEÇÃO 3.1:
+
+Após o pré-processamento (voxel \textit{downsampling} de 5~mm com preservação de \textit{labels}), o conjunto totaliza aproximadamente 69.418.584 pontos, dos quais 3.69\% pertencem à classe \textit{flange} e 96.31\% à classe \textit{equipamento}, o que corresponde a uma razão aproximada de 1:26 entre as classes. Esse forte desbalanceamento persiste mesmo após a subamostragem por \textit{voxel}, motivando o uso da \textit{Focal Loss} com peso $\alpha_{\text{flange}} = 8{,}0$ (Seção~\ref{sec:train}).
+
+OPCIONAL — TABELA POR CONJUNTO (pode entrar na Seção 3.1):
+
+\begin{table}[H]
+\centering
+\caption{Distribuição de pontos por classe nos conjuntos de treino, validação e teste, após \textit{voxel downsampling} de 5~mm.}
+\label{tab:class_distribution}
+\begin{tabular}{lcccc}
+\hline
+\textbf{Conjunto} & \textbf{Equip.} & \textbf{Total pts} & \textbf{\% Flange} & \textbf{Razão} \\
+\hline
+Treino & 19 & 59.727.318 & 3.20 & $1:30$ \\
+Validação & 4 & 4.786.189 & 5.92 & $1:16$ \\
+Teste & 5 & 4.905.077 & 7.43 & $1:12$ \\
+\hline
+\textbf{Total} & \textbf{28} & \textbf{69.418.584} & \textbf{3.69} & $\mathbf{1:26}$ \\
+\hline
+\end{tabular}
+\end{table}
