@@ -7,3 +7,5 @@ DATA
 DATA_PREPROCESSED_v5
 DATA_PREPROCESSED_v7
 DATA_CRU
+final_segmentation_Model_article/inference_v7_results/
+*.ply
